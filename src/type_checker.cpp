@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -52,6 +53,13 @@ std::string MangleRecordTypeId(const std::string& id,
   }
 }
 
+auto
+    id_is_global  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables):
+                  // Accessible only within this translation unit;
+                  // declaring as a data member introduces unnecessary
+                  // dependency.
+    = std::map<std::string, bool>{};
+
 }  // namespace
 
 void TypeChecker::Visit(DeclStmtNode& decl_stmt) {
@@ -62,6 +70,10 @@ void TypeChecker::Visit(DeclStmtNode& decl_stmt) {
 
 void TypeChecker::Visit(VarDeclNode& decl) {
   if (decl.init) {
+    if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+      decl.init->is_global = true;
+    }
+
     decl.init->Accept(*this);
     if (decl.init->type != decl.type) {
       // TODO: incompatible types when initializing type 'type' using type
@@ -74,6 +86,11 @@ void TypeChecker::Visit(VarDeclNode& decl) {
   } else {
     auto symbol = std::make_unique<SymbolEntry>(decl.id, decl.type->Clone());
     env_.AddSymbol(std::move(symbol), env_.CurrentScopeKind());
+
+    if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+      decl.is_global = true;
+      id_is_global[decl.id] = true;
+    }
   }
 }
 
@@ -89,8 +106,17 @@ void TypeChecker::Visit(ArrDeclNode& arr_decl) {
       if (!init->type->IsEqual(*symbol->type)) {
         // TODO: element unmatches array element type
       }
+
+      if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+        init->is_global = true;
+      }
     }
     env_.AddSymbol(std::move(symbol), env_.CurrentScopeKind());
+
+    if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+      arr_decl.is_global = true;
+      id_is_global[arr_decl.id] = true;
+    }
   }
 
   // TODO: Check initializer type
@@ -142,8 +168,15 @@ void TypeChecker::Visit(RecordVarDeclNode& record_var_decl) {
     // TODO: type check between fields and initialized members.
     for (auto& init : record_var_decl.inits) {
       init->Accept(*this);
+      if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+        init->is_global = true;
+      }
     }
     env_.AddSymbol(std::move(symbol), env_.CurrentScopeKind());
+    if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+      record_var_decl.is_global = true;
+      id_is_global[record_var_decl.id] = true;
+    }
 
     record_var_decl.type = record_type->type->Clone();
   }
@@ -384,6 +417,9 @@ void TypeChecker::Visit(InitExprNode& init_expr) {
   }
   init_expr.expr->Accept(*this);
   init_expr.type = init_expr.expr->type->Clone();
+  if (env_.CurrentScopeKind() == ScopeKind::kFile) {
+    init_expr.expr->is_global = true;
+  }
 }
 
 void TypeChecker::Visit(ArrDesNode& arr_des) {
@@ -404,6 +440,9 @@ void TypeChecker::Visit(NullExprNode&) {
 void TypeChecker::Visit(IdExprNode& id_expr) {
   if (auto symbol = env_.LookUpSymbol(id_expr.id)) {
     id_expr.type = symbol->type->Clone();
+    if (id_is_global.count(id_expr.id) != 0) {
+      id_expr.is_global = true;
+    }
   } else {
     // TODO: 'id' undeclared
     assert(false);
@@ -426,6 +465,9 @@ void TypeChecker::Visit(ArrSubExprNode& arr_sub_expr) {
   assert(arr_type);
   // arr_sub_expr should have the element type of the array.
   arr_sub_expr.type = arr_type->element_type().Clone();
+  if (arr_sub_expr.arr->is_global) {
+    arr_sub_expr.is_global = true;
+  }
 }
 
 void TypeChecker::Visit(CondExprNode& cond_expr) {

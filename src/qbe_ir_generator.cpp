@@ -94,6 +94,12 @@ auto
                        // dependency.
     = std::map<int, int>{};
 
+auto
+    reg_num_to_id  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables):
+                   // Accessible only within this translation unit; declaring as
+                   // a data member introduces unnecessary dependency.
+    = std::map<int, std::string>{};
+
 /// @brief Every expression generates a temporary. The local number of such
 /// temporary should be stored, so can propagate to later uses.
 class PrevExprNumRecorder {
@@ -133,6 +139,32 @@ auto
     label_views_of_jumpable_blocks  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
     = std::vector<LabelViewPair>{};
 
+struct GlobalVarInitVal {
+  // TODO: support other types, such as float, long, short
+  std::variant<int> value;
+  std::shared_ptr<Type> type;
+};
+
+/// @brief Stores values from bottom level nodes and pass them to upper leve
+/// nodes because global variables are required to initialize exact values at
+/// declaration.
+auto
+    global_var_init_vals  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    = std::vector<GlobalVarInitVal>{};
+
+/// @brief Generate corresponding QBE string based on `type` and `value`.
+/// @return formatted QBE string with type and value, e.g. w 4 (word of value 4)
+std::string GenerateQBEInit(const GlobalVarInitVal& init) {
+  return std::visit(
+      [&init](auto&& arg) {
+        if (init.type->IsEqual(PrimitiveType::kInt)) {
+          return "w " + std::to_string(arg);
+        }
+        return std::string("");
+      },
+      init.value);
+}
+
 }  // namespace
 
 void QbeIrGenerator::Visit(const DeclStmtNode& decl_stmt) {
@@ -144,65 +176,104 @@ void QbeIrGenerator::Visit(const DeclStmtNode& decl_stmt) {
 }
 
 void QbeIrGenerator::Visit(const VarDeclNode& decl) {
-  int id_num = NextLocalNum();
-  WriteInstr_("{} =l alloc{} {}", FuncScopeTemp{id_num}, decl.type->size(),
-              decl.type->size());
-  if (decl.init) {
-    decl.init->Accept(*this);
-    int init_num = num_recorder.NumOfPrevExpr();
-    // A pointer declaration may have two options for its right hand side:
-    if (decl.init->type->IsPtr() || decl.init->type->IsFunc()) {
-      // 1. int* a = &b; rhs is a reference of integer. We need to store b's
-      // address to a, where we need to map b's reg_num back to its id_num.
-      if (dynamic_cast<UnaryExprNode*>((decl.init).get())) {
-        WriteInstr_("storel {}, {}",
-                    FuncScopeTemp{reg_num_to_id_num.at(init_num)},
-                    FuncScopeTemp{id_num});
+  if (decl.is_global) {
+    // TODO: support different data types.
+    if (decl.init) {
+      global_var_init_vals.clear();
+      decl.init->Accept(*this);
+      Write_("export data {} = align {} {{ {} }}\n",
+             user_defined::GlobalPointer{decl.id}, decl.type->size(),
+             GenerateQBEInit(global_var_init_vals.at(0)));
+    } else {
+      // `z` in QBE stands for allocating n bytes of memory space.
+      Write_("export data {0} = align {1} {{ z {1} }}\n",
+             user_defined::GlobalPointer{decl.id}, decl.type->size());
+    }
+  } else {
+    int id_num = NextLocalNum();
+    WriteInstr_("{} =l alloc{} {}", FuncScopeTemp{id_num}, decl.type->size(),
+                decl.type->size());
+    if (decl.init) {
+      decl.init->Accept(*this);
+      int init_num = num_recorder.NumOfPrevExpr();
+      // A pointer declaration may have two options for its right hand side:
+      if (decl.init->type->IsPtr() || decl.init->type->IsFunc()) {
+        // 1. int* a = &b; rhs is a reference of integer. We need to store b's
+        // address to a, where we need to map b's reg_num back to its id_num.
+        if (dynamic_cast<UnaryExprNode*>((decl.init).get())) {
+          WriteInstr_("storel {}, {}",
+                      FuncScopeTemp{reg_num_to_id_num.at(init_num)},
+                      FuncScopeTemp{id_num});
+        } else {
+          // 2. int* a = c; c itself stores the address of another integer. We
+          // can directly use the address c currently holds.
+          WriteInstr_("storel {}, {}", FuncScopeTemp{init_num},
+                      FuncScopeTemp{id_num});
+        }
       } else {
-        // 2. int* a = c; c itself stores the address of another integer. We can
-        // directly use the address c currently holds.
-        WriteInstr_("storel {}, {}", FuncScopeTemp{init_num},
+        WriteInstr_("storew {}, {}", FuncScopeTemp{init_num},
                     FuncScopeTemp{id_num});
       }
-    } else {
-      WriteInstr_("storew {}, {}", FuncScopeTemp{init_num},
-                  FuncScopeTemp{id_num});
     }
+    // Set up the number of the id so we know were to load it back.
+    id_to_num[decl.id] = id_num;
   }
-  // Set up the number of the id so we know were to load it back.
-  id_to_num[decl.id] = id_num;
 }
 
 void QbeIrGenerator::Visit(const ArrDeclNode& arr_decl) {
-  int base_addr_num = NextLocalNum();
-  assert(arr_decl.type->IsArr());
-  const auto* arr_type = dynamic_cast<ArrType*>((arr_decl.type).get());
-  auto element_size = arr_type->element_type().size();
-  WriteInstr_("{} =l alloc{} {}", FuncScopeTemp{base_addr_num}, element_size,
-              arr_decl.type->size());
-  id_to_num[arr_decl.id] = base_addr_num;
-
-  for (auto i = std::size_t{0}, e = arr_type->len(); i < e; ++i) {
-    if (i < arr_decl.init_list.size()) {
-      auto& arr_init = arr_decl.init_list.at(i);
-      arr_init->Accept(*this);
-    }
-
-    const int offset = NextLocalNum();
-    WriteInstr_("{} =l extsw {}", FuncScopeTemp{offset}, i * element_size);
-
-    // res_addr = base_addr + offset
-    const int res_addr_num = NextLocalNum();
-    WriteInstr_("{} =l add {}, {}", FuncScopeTemp{res_addr_num},
-                FuncScopeTemp{base_addr_num}, FuncScopeTemp{offset});
-
-    if (i < arr_decl.init_list.size()) {
-      int init_val_num = num_recorder.NumOfPrevExpr();
-      WriteInstr_("storew {}, {}", FuncScopeTemp{init_val_num},
-                  FuncScopeTemp{res_addr_num});
+  if (arr_decl.is_global) {
+    const auto* arr_type = dynamic_cast<ArrType*>((arr_decl.type).get());
+    assert(arr_type);
+    if (arr_decl.init_list.size() != 0) {
+      global_var_init_vals.clear();
+      Write_("export data {} = align {} {{ ",
+             user_defined::GlobalPointer{arr_decl.id},
+             arr_type->element_type().size());
+      for (auto i = std::size_t{0}, e = arr_type->len(); i < e; ++i) {
+        auto& arr_init = arr_decl.init_list.at(i);
+        arr_init->Accept(*this);
+        Write_("{}", GenerateQBEInit(global_var_init_vals.at(i)));
+        if (i != e - 1) {
+          Write_(", ");
+        }
+      }
+      Write_(" }}\n");
     } else {
-      // set remaining elements as 0
-      WriteInstr_("storew 0, {}", FuncScopeTemp{res_addr_num});
+      Write_("export data {} = align {} {{ z {} }}\n",
+             user_defined::GlobalPointer{arr_decl.id},
+             arr_type->element_type().size(), arr_decl.type->size());
+    }
+  } else {
+    int base_addr_num = NextLocalNum();
+    assert(arr_decl.type->IsArr());
+    const auto* arr_type = dynamic_cast<ArrType*>((arr_decl.type).get());
+    auto element_size = arr_type->element_type().size();
+    WriteInstr_("{} =l alloc{} {}", FuncScopeTemp{base_addr_num}, element_size,
+                arr_decl.type->size());
+    id_to_num[arr_decl.id] = base_addr_num;
+
+    for (auto i = std::size_t{0}, e = arr_type->len(); i < e; ++i) {
+      if (i < arr_decl.init_list.size()) {
+        auto& arr_init = arr_decl.init_list.at(i);
+        arr_init->Accept(*this);
+      }
+
+      const int offset = NextLocalNum();
+      WriteInstr_("{} =l extsw {}", FuncScopeTemp{offset}, i * element_size);
+
+      // res_addr = base_addr + offset
+      const int res_addr_num = NextLocalNum();
+      WriteInstr_("{} =l add {}, {}", FuncScopeTemp{res_addr_num},
+                  FuncScopeTemp{base_addr_num}, FuncScopeTemp{offset});
+
+      if (i < arr_decl.init_list.size()) {
+        int init_val_num = num_recorder.NumOfPrevExpr();
+        WriteInstr_("storew {}, {}", FuncScopeTemp{init_val_num},
+                    FuncScopeTemp{res_addr_num});
+      } else {
+        // set remaining elements as 0
+        WriteInstr_("storew 0, {}", FuncScopeTemp{res_addr_num});
+      }
     }
   }
 }
@@ -644,28 +715,41 @@ void QbeIrGenerator::Visit(const IdExprNode& id_expr) {
     num_recorder.Record(res_num);
     return;
   }
-  assert(id_to_num.count(id_expr.id) != 0);
-  /// @brief Plays the role of a "pointer". Its value has to be loaded to
-  /// the register before use.
-  int id_num = id_to_num.at(id_expr.id);
-  int reg_num = NextLocalNum();
-  if (id_expr.type->IsPtr() || id_expr.type->IsFunc()) {
-    WriteInstr_("{} =l loadl {}", FuncScopeTemp{reg_num},
-                FuncScopeTemp{id_num});
-  } else {
+  if (id_expr.is_global) {
+    int reg_num = NextLocalNum();
     WriteInstr_("{} =w loadw {}", FuncScopeTemp{reg_num},
-                FuncScopeTemp{id_num});
+                user_defined::GlobalPointer{id_expr.id});
+    num_recorder.Record(reg_num);
+    reg_num_to_id[reg_num] = id_expr.id;
+  } else {
+    assert(id_to_num.count(id_expr.id) != 0);
+    /// @brief Plays the role of a "pointer". Its value has to be loaded to
+    /// the register before use.
+    int id_num = id_to_num.at(id_expr.id);
+    int reg_num = NextLocalNum();
+    if (id_expr.type->IsPtr() || id_expr.type->IsFunc()) {
+      WriteInstr_("{} =l loadl {}", FuncScopeTemp{reg_num},
+                  FuncScopeTemp{id_num});
+    } else {
+      WriteInstr_("{} =w loadw {}", FuncScopeTemp{reg_num},
+                  FuncScopeTemp{id_num});
+    }
+    num_recorder.Record(reg_num);
+    // Map the temporary reg_num to id_num, so that upper level nodes can store
+    // value to id_num instead of reg_num.
+    reg_num_to_id_num[reg_num] = id_num;
   }
-  num_recorder.Record(reg_num);
-  // Map the temporary reg_num to id_num, so that upper level nodes can store
-  // value to id_num instead of reg_num.
-  reg_num_to_id_num[reg_num] = id_num;
 }
 
 void QbeIrGenerator::Visit(const IntConstExprNode& int_expr) {
-  int num = NextLocalNum();
-  WriteInstr_("{} =w copy {}", FuncScopeTemp{num}, int_expr.val);
-  num_recorder.Record(num);
+  if (int_expr.is_global) {
+    global_var_init_vals.push_back(
+        {int_expr.val, std::make_shared<PrimType>(PrimitiveType::kInt)});
+  } else {
+    int num = NextLocalNum();
+    WriteInstr_("{} =w copy {}", FuncScopeTemp{num}, int_expr.val);
+    num_recorder.Record(num);
+  }
 }
 
 void QbeIrGenerator::Visit(const ArgExprNode& arg_expr) {
@@ -675,8 +759,6 @@ void QbeIrGenerator::Visit(const ArgExprNode& arg_expr) {
 void QbeIrGenerator::Visit(const ArrSubExprNode& arr_sub_expr) {
   arr_sub_expr.arr->Accept(*this);
   const int reg_num = num_recorder.NumOfPrevExpr();
-  // address of the first element
-  const int base_addr = reg_num_to_id_num.at(reg_num);
   arr_sub_expr.index->Accept(*this);
   const int index_num = num_recorder.NumOfPrevExpr();
 
@@ -696,8 +778,16 @@ void QbeIrGenerator::Visit(const ArrSubExprNode& arr_sub_expr) {
 
   // res_addr = base_addr + offset
   const int res_addr_num = NextLocalNum();
-  WriteInstr_("{} =l add {}, {}", FuncScopeTemp{res_addr_num},
-              FuncScopeTemp{base_addr}, FuncScopeTemp{offset});
+  if (arr_sub_expr.is_global) {
+    const auto id = reg_num_to_id.at(reg_num);
+    WriteInstr_("{} =l add {}, {}", FuncScopeTemp{res_addr_num},
+                user_defined::GlobalPointer{id}, FuncScopeTemp{offset});
+  } else {
+    // address of the first element
+    const int base_addr = reg_num_to_id_num.at(reg_num);
+    WriteInstr_("{} =l add {}, {}", FuncScopeTemp{res_addr_num},
+                FuncScopeTemp{base_addr}, FuncScopeTemp{offset});
+  }
 
   // load value from res_addr
   const int res_num = NextLocalNum();
